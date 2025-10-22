@@ -1,0 +1,110 @@
+# 02_models.R  — runnable, survey-weighted, clean --------------------------
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(forcats)
+  library(survey); library(broom)
+})
+
+# ---- paths (relative) ----
+RAW <- "data_raw/usa_00003.csv"
+OUT_TAB <- "outputs/tables"
+dir.create(OUT_TAB, recursive = TRUE, showWarnings = FALSE)
+
+# ---- load ----
+d <- read_csv(RAW, show_col_types = FALSE)
+
+# ---- filters (documented assumptions) ----
+# Codes assumed (IPUMS ACS typical):
+# HCOVANY/PRIV/PUB: 1 = no, 2 = yes   → recode to 0/1
+# EMPSTAT: keep 1/2/3 (employed, unemployed, NILF)
+# CLASSWKRD: keep common working categories listed below
+# Income range trimmed, zeros kept via log1p
+d <- d %>%
+  filter(
+    AGE >= 18,
+    SEX %in% c(1,2),
+    EMPSTAT %in% c(1,2,3),
+    HCOVANY %in% c(1,2), HCOVPRIV %in% c(1,2), HCOVPUB %in% c(1,2),
+    INCTOT >= 0, INCTOT <= 300000,
+    FTOTINC != 9999999,
+    INCWAGE != 999999
+  ) %>%
+  mutate(
+    any  = if_else(HCOVANY == 2, 1L, 0L),
+    priv = if_else(HCOVPRIV == 2, 1L, 0L),
+    pub  = if_else(HCOVPUB  == 2, 1L, 0L),
+    # ONE income measure in main models to avoid multicollinearity:
+    log_income = log1p(FTOTINC),
+    sex = factor(SEX, levels = c(1,2), labels = c("male","female"))
+  )
+
+# ---- class of worker (use ONE taxonomy) ----
+# Keep a standard set; set a single clear reference = Private wage/salary
+keep_levels <- c(20, 22, 23, 24, 25, 27, 28, 29, 10, 11, 12, 13, 14)
+labels <- c(
+  "Private wage/salary",   # 20
+  "Nonprofit",             # 22
+  "Government (any)",      # 23
+  "Federal",               # 24
+  "State",                 # 25
+  "Local",                 # 27
+  "Unpaid family",         # 28
+  "Self-employed (all)",   # 29
+  "Self-employed",         # 10
+  "Employer",              # 11
+  "Own account",           # 12
+  "Self-employed, non-inc",# 13
+  "Self-employed, inc"     # 14
+)
+d <- d %>%
+  filter(CLASSWKRD %in% keep_levels) %>%
+  mutate(
+    class = factor(CLASSWKRD, levels = keep_levels, labels = labels),
+    class = fct_relevel(class, "Private wage/salary")
+  )
+
+# ---- education (factor) ----
+# If EDUC is numeric codes, treat as ordered factor or dummies
+d <- d %>%
+  mutate(educ = factor(EDUC))
+
+# ---- survey design (weights) ----
+# If your extract includes STRATA/PSU, add them here; otherwise ids=~1 is fine.
+stopifnot("PERWT" %in% names(d))
+des <- svydesign(ids = ~1, weights = ~PERWT, data = d)
+
+# ---- fit models: any, private, public ----
+fit_any  <- svyglm(any  ~ class + educ + AGE + sex + log_income,
+                   design = des, family = quasibinomial())
+fit_priv <- svyglm(priv ~ class + educ + AGE + sex + log_income,
+                   design = des, family = quasibinomial())
+fit_pub  <- svyglm(pub  ~ class + educ + AGE + sex + log_income,
+                   design = des, family = quasibinomial())
+
+# ---- tidy + OR table ----
+to_tbl <- function(m, name){
+  broom::tidy(m, conf.int = TRUE) |>
+    mutate(odds_ratio = exp(estimate),
+           or_low = exp(conf.low), or_high = exp(conf.high),
+           model = name) |>
+    select(model, term, estimate, odds_ratio, or_low, or_high, p.value)
+}
+tab <- bind_rows(
+  to_tbl(fit_any,  "ANY"),
+  to_tbl(fit_priv, "PRIVATE"),
+  to_tbl(fit_pub,  "PUBLIC")
+)
+
+# ---- save outputs ----
+write_csv(tab, file.path(OUT_TAB, "models_or.csv"))
+
+# Optional: simple descriptives
+desc <- tibble(
+  n = nrow(d),
+  mean_age = mean(d$AGE, na.rm = TRUE),
+  p_any  = mean(d$any),
+  p_priv = mean(d$priv),
+  p_pub  = mean(d$pub)
+)
+write_csv(desc, file.path(OUT_TAB, "descriptives.csv"))
+
+message("Done. See outputs/tables/models_or.csv and descriptives.csv")
